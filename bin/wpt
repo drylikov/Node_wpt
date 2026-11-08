@@ -1,0 +1,130 @@
+
+#!/usr/bin/env node
+
+
+var args = require('argsparser').parse();
+var fs = require('fs');
+var path = require('path');
+var _wpt = require('../');
+var WPT = _wpt.WPT;
+var Test = _wpt.Test;
+var winston = require("winston");
+var str = require("str.js");
+var Splunk = require('../lib/splunk').Splunk;
+var cwd = process.cwd();
+
+var config = (function(file) {
+  var json = fs.readFileSync(file);
+  return JSON.parse(json);
+}(args['--config'] || path.join(cwd, 'config.json')));
+
+
+var transports = [];
+
+if (config.transports) {
+  if (config.transports.splunk) {
+    transports.push(new Splunk(config.transports.splunk));
+  }
+  if (config.transports.console) {
+    transports.push(new (winston.transports.Console)());
+  }
+}
+
+var infoLog = new (winston.Logger)({
+  transports: [
+    new (winston.transports.Console)()
+  ]
+});
+
+var dataLog = new (winston.Logger)({
+  transports: transports 
+});
+
+var wpt = new WPT(config.apikey);
+
+var logHarFile = function(test) {
+  if (config.logHarFile === true) {
+    wpt.getHARFile(test.id, function(json) {
+      var startTime = new Date(json.log.pages[0].startedDateTime).getTime();
+      var onLoad = json.log.pages[0].pageTimings.onLoad;
+      for (var i = 0, c = json.log.entries.length; i < c; i++) {
+        var entry = json.log.entries[i];
+        if (entry.pageref == "page_1_0") {
+          var offsetTime = (new Date(entry.startedDateTime).getTime()) - startTime;
+          var beforeLoad = (offsetTime < onLoad);
+          dataLog.info("har", { testId: test.id, testUrl: test.url, requestUrl: entry.request.url, url: entry.request.url, size: entry.response.bodySize, time: entry.time, status: entry.response.status, beforeLoad: beforeLoad, timings: entry.timings, offsetTime: offsetTime, location: test.options.location, meta: test.meta });
+        }
+      }
+    });
+  }
+};
+
+wpt.on("startTest", function(test, data) {
+  infoLog.info(str.format("Test Started: {url} {location} {id}", { url: test.url, location: test.options.location, id: test.id }));
+});
+
+wpt.on("endTest", function(test) {
+  var testResult = test.results;
+  if (!testResult.run || !testResult.run.firstView) {
+    infoLog.error(str.format("Test Incomplete: {url} {id} {summary}", { url: testResult.testUrl, id: testResult.testId, summary: testResult.summary }));
+    dataLog.info("incomplete", { url: testResult.testUrl, id: testResult.testId, summary: testResult.summary, location: testResult.location });
+  } else {
+    infoLog.info(str.format("Test Complete: {url} {location} {id} {summary}", { url: testResult.testUrl, id: testResult.testId, summary: testResult.summary, location: testResult.location }));
+    try {
+
+      if (testResult.run.firstView.results.docTime !== 0) {
+        dataLog.info("firstView", {
+          testId: testResult.testId,
+          summary: testResult.summary,
+          url: testResult.testUrl,
+          completed: new Date(testResult.completed).getTime(),
+          results: testResult.run.firstView.results,
+          images: testResult.run.firstView.images,
+          location: testResult.location,
+          meta: test.meta
+        });
+
+        if (testResult.run.repeatView && testResult.run.repeatView.results.docTime !== 0) {
+          dataLog.info("repeatView", {
+            testId: testResult.testId,
+            summary: testResult.summary,
+            url: testResult.testUrl,
+            completed: new Date(testResult.completed).getTime(),
+            results: testResult.run.repeatView.results,
+            images: testResult.run.repeatView.images,
+            location: testResult.location,
+            meta: test.meta
+          });
+        }
+      } else {
+        infoLog.error("timeout", {
+          testId: testResult.testId,
+          summary: testResult.summary,
+          url: testResult.testUrl
+        });
+        dataLog.error("timeout", {
+          testId: testResult.testId,
+          summary: testResult.summary,
+          url: testResult.testUrl
+        });
+      }
+    } catch(e) {
+      console.log(e);
+      infoLog.error(e);
+      console.log(testResult.run);
+    }
+    logHarFile(test);
+  }
+});
+
+wpt.on('endBatch', function() {
+  console.log('Batch Complete');
+});
+
+infoLog.info("Starting batch, this may take awhile");
+var runBatch = function() {
+  wpt.runBatch(config.tests, config.locations);
+};
+runBatch();
+//wpt.getResults("110614_6A_TW3Q");
+//logHarFile("110614_6A_TW3Q");
